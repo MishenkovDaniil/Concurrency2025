@@ -1,0 +1,7 @@
+.vscode
+.git
+CMakeCache.txt
+build/
+CMakeCache.txt
+CMakeFiles/
+.cache/

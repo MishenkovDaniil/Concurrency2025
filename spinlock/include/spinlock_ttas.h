@@ -27,5 +27,28 @@ void spinlock_ttas_optimal_lock(void *);
 void spinlock_ttas_optimal_unlock(void *);
 
 
+typedef struct spinlock_ttas_nop
+{
+    atomic_uint m_spin;
+} spinlock_ttas_nop_t;
+
+spinlock_ttas_nop_t *spinlock_ttas_nop_ctor();
+void spinlock_ttas_nop_dtor(spinlock_ttas_nop_t *);
+
+void spinlock_ttas_nop_lock(void *);
+void spinlock_ttas_nop_unlock(void *);
+
+typedef struct spinlock_ttas_yield
+{
+    atomic_uint m_spin;
+} spinlock_ttas_yield_t;
+
+spinlock_ttas_yield_t *spinlock_ttas_yield_ctor();
+void spinlock_ttas_yield_dtor(spinlock_ttas_yield_t *);
+
+void spinlock_ttas_yield_lock(void *);
+void spinlock_ttas_yield_unlock(void *);
+
+
 
 #endif /* SPIN_LOCK_TTAS_H */

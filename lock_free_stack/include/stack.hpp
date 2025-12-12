@@ -1,11 +1,33 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <random>
+#include <thread>
 
 #include "hp.hpp"
+
+// Exponential backoff with random jitter
+inline void exponential_backoff(int attempt)
+{
+    if (attempt == 0)
+        return;
+
+    int max_delay_ns = std::min(1 << attempt, 100) * 10;
+
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<> dis(0, max_delay_ns);
+    int delay_ns = dis(gen);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    while (std::chrono::high_resolution_clock::now() - start < std::chrono::nanoseconds(delay_ns))
+    {
+        asm volatile("pause");
+    }
+}
 
 struct data_to_reclaim_base
 {
@@ -72,19 +94,23 @@ template <typename T> class LFStack
     {
         Node *new_node = new Node(data);
         new_node->m_next = m_head.load(std::memory_order_relaxed);
+        int attempts = 0;
         while (!m_head.compare_exchange_weak(new_node->m_next, new_node, std::memory_order_release,
                                              std::memory_order_relaxed))
-            ;
+        {
+            exponential_backoff(attempts);
+            attempts = (attempts < 10) ? attempts + 1 : 10; // up to 10
+        }
     }
 
     std::shared_ptr<T> pop(void)
     {
         std::atomic<void *> &hp = get_hazard_pointer_for_current_thread();
-
-        // acquire/release with CAS loop
         Node *old_head = m_head.load(std::memory_order_acquire);
         Node *temp = nullptr;
-        do
+        int attempts = 0;
+
+        while (true)
         {
             do
             {
@@ -92,8 +118,20 @@ template <typename T> class LFStack
                 hp.store(old_head);
                 old_head = m_head.load(std::memory_order_relaxed);
             } while (old_head != temp);
-        } while (old_head && !m_head.compare_exchange_strong(old_head, old_head->m_next, std::memory_order_release,
-                                                             std::memory_order_relaxed));
+
+            if (!old_head)
+                break;
+
+            if (m_head.compare_exchange_strong(old_head, old_head->m_next, std::memory_order_release,
+                                               std::memory_order_relaxed))
+                break;
+
+            // apply backoff only if already failed to change head
+            exponential_backoff(attempts);
+            attempts = (attempts < 10) ? attempts + 1 : 10;
+            old_head = m_head.load(std::memory_order_acquire);
+        }
+
         hp.store(nullptr);
 
         std::shared_ptr<T> res;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -9,6 +10,10 @@
 #include <thread>
 
 #include "hp.hpp"
+
+#ifndef LFSTACK_ENABLE_ELIMINATION
+#define LFSTACK_ENABLE_ELIMINATION 0
+#endif
 
 // Exponential backoff with random jitter
 inline void exponential_backoff(int attempt)
@@ -65,6 +70,103 @@ template <typename T> void reclaim_later(T *data)
     add_to_reclaim_list(new data_to_reclaim<T>(data));
 }
 
+#if LFSTACK_ENABLE_ELIMINATION
+
+enum class ElimOp : int
+{
+    Empty = 0,
+    Push = 1
+};
+
+template <typename T> class EliminationArray
+{
+  private:
+    static constexpr int ELIM_SIZE = 8;
+    static constexpr int ELIM_TIMEOUT_NS = 2000;
+
+    struct Slot
+    {
+        std::atomic<ElimOp> m_op{ElimOp::Empty};
+        std::atomic<bool> m_busy{false};
+        T m_value{};
+    };
+
+    std::array<Slot, ELIM_SIZE> m_slots;
+
+    int random_index() const
+    {
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::uniform_int_distribution<int> dis(0, ELIM_SIZE - 1);
+        return dis(gen);
+    }
+
+  public:
+    EliminationArray() = default;
+
+    bool try_eliminate_push(const T &value)
+    {
+        int idx = random_index();
+        Slot &slot = m_slots[idx];
+
+        ElimOp expected = ElimOp::Empty;
+        if (!slot.m_op.compare_exchange_strong(expected, ElimOp::Push, std::memory_order_acq_rel,
+                                               std::memory_order_relaxed))
+        {
+            return false; // slot already used
+        }
+
+        slot.m_value = value;
+        slot.m_busy.store(false, std::memory_order_release);
+
+        auto start = std::chrono::high_resolution_clock::now();
+        while (true)
+        {
+            if (slot.m_busy.load(std::memory_order_acquire))
+            {
+                // Pop has taken the value
+                slot.m_op.store(ElimOp::Empty, std::memory_order_release);
+                slot.m_busy.store(false, std::memory_order_release);
+                return true;
+            }
+
+            auto elapsed = std::chrono::high_resolution_clock::now() - start;
+            if (elapsed > std::chrono::nanoseconds(ELIM_TIMEOUT_NS))
+            {
+                ElimOp cur = slot.m_op.load(std::memory_order_acquire);
+                if (cur == ElimOp::Push && !slot.m_busy.load(std::memory_order_acquire))
+                {
+                    slot.m_op.store(ElimOp::Empty, std::memory_order_release);
+                }
+                return false;
+            }
+
+            asm volatile("pause");
+        }
+    }
+
+    bool try_eliminate_pop(T &out)
+    {
+        int idx = random_index();
+        Slot &slot = m_slots[idx];
+
+        if (slot.m_op.load(std::memory_order_acquire) != ElimOp::Push)
+            return false;
+
+        bool expected_busy = false;
+        if (!slot.m_busy.compare_exchange_strong(expected_busy, true, std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed))
+        {
+            return false; // someone else racing
+        }
+
+        out = slot.m_value;
+        slot.m_busy.store(true, std::memory_order_release);
+        slot.m_op.store(ElimOp::Empty, std::memory_order_release);
+        return true;
+    }
+};
+#endif // LFSTACK_ENABLE_ELIMINATION
+
 template <typename T> class LFStack
 {
   private:
@@ -77,6 +179,9 @@ template <typename T> class LFStack
         }
     };
     std::atomic<Node *> m_head;
+#if LFSTACK_ENABLE_ELIMINATION
+    EliminationArray<T> m_elim;
+#endif
 
   public:
     LFStack() : m_head(nullptr)
@@ -98,13 +203,30 @@ template <typename T> class LFStack
         while (!m_head.compare_exchange_weak(new_node->m_next, new_node, std::memory_order_release,
                                              std::memory_order_relaxed))
         {
+#if LFSTACK_ENABLE_ELIMINATION
+            if (attempts > 3)
+            {
+                if (m_elim.try_eliminate_push(data))
+                {
+                    delete new_node;
+                    return;
+                }
+            }
+#endif
             exponential_backoff(attempts);
-            attempts = (attempts < 10) ? attempts + 1 : 10; // up to 10
+            attempts = (attempts < 10) ? attempts + 1 : 10;
         }
     }
 
     std::shared_ptr<T> pop(void)
     {
+#if LFSTACK_ENABLE_ELIMINATION
+        T eliminated_value{};
+        if (m_elim.try_eliminate_pop(eliminated_value))
+        {
+            return std::make_shared<T>(eliminated_value);
+        }
+#endif
         std::atomic<void *> &hp = get_hazard_pointer_for_current_thread();
         Node *old_head = m_head.load(std::memory_order_acquire);
         Node *temp = nullptr;
@@ -126,7 +248,6 @@ template <typename T> class LFStack
                                                std::memory_order_relaxed))
                 break;
 
-            // apply backoff only if already failed to change head
             exponential_backoff(attempts);
             attempts = (attempts < 10) ? attempts + 1 : 10;
             old_head = m_head.load(std::memory_order_acquire);
@@ -150,7 +271,6 @@ template <typename T> class LFStack
             if (nodes_to_reclaim_count.load(std::memory_order_acquire) >= 2 * 100)
             {
                 bool expected = false;
-                // acquire/release with delete_nodes_with_no_hazards store()
                 if (reclamation_in_progress.compare_exchange_strong(expected, true, std::memory_order_acquire,
                                                                     std::memory_order_relaxed))
                 {
